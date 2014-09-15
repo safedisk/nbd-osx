@@ -1,0 +1,21 @@
+Kernel debugging:
+
+https://developer.apple.com/library/mac/documentation/Darwin/Conceptual/KEXTConcept/KEXTConceptDebugger/debug_tutorial.html
+https://code.google.com/p/maczfs/wiki/KernelDebugging
+http://ho.ax/posts/2012/02/debugging-the-mac-os-x-kernel-with-vmware-and-gdb/
+
+
+Target machine preparation:
+
+$ sudo -s
+# cd /
+# cp -r /Volumes/KernelDebugKit/DEBUG_Kernel/mach_kernel* /
+# touch /System/Library/Extensions
+# shutdown -r now
+
+
+Put this into ~/.lldbinit:
+
+settings set target.load-script-from-symbol-file true
+target modules add /Users/flaub/src/safedisk/xnu/nbd/build/Debug/nbd.kext/Contents/MacOS/nbd
+
