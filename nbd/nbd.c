@@ -13,7 +13,10 @@
 #include <sys/conf.h>
 #include <sys/buf.h>
 #include <sys/disk.h>
+#include <sys/file.h>
+#include <sys/kpi_socket.h>
 #include <miscfs/devfs/devfs.h>
+#include <libkern/OSByteOrder.h>
 
 #define NBD_DEVICE_BASENAME "nbd"
 
@@ -27,13 +30,15 @@ struct nbd_device
     pid_t      pid;
     dev_t      dev;
     void*      bdev;
+    socket_t   sock;
+    int        flags;
     uint32_t   block_size;
     uint64_t   disk_size;
 } nbd_table[NBD_DEVICES];
 
 int nbd_open(dev_t dev, int flags, int devtype, struct proc* p);
 int nbd_close(dev_t dev, int flags, int devtype, struct proc* p);
-void nbd_strategy(struct buf* bp);
+void nbd_strategy(buf_t bp);
 int nbd_ioctl(dev_t dev, u_long cmd, caddr_t data, int fflag, struct proc* p);
 int nbd_dump(void);
 int nbd_psize(dev_t dev);
@@ -48,11 +53,11 @@ static struct bdevsw nbd_bdevsw = {
 	D_DISK,
 };
 
-
 const char* ioctl_cmd(u_long cmd)
 {
 	#define CODE_CASE(code) case code: return #code;
 	switch (cmd) {
+		// Disk commands
 		CODE_CASE(DKIOCEJECT);
 		CODE_CASE(DKIOCSYNCHRONIZECACHE);
 		CODE_CASE(DKIOCFORMAT);
@@ -88,6 +93,33 @@ const char* ioctl_cmd(u_long cmd)
 		CODE_CASE(DKIOCGETPHYSICALEXTENT);
 		CODE_CASE(DKIOCUNLOCKPHYSICALEXTENTS);
 		CODE_CASE(DKIOCGETMAXPRIORITYCOUNT);
+		// NBD commands
+		CODE_CASE(NBD_SET_SOCK);
+		CODE_CASE(NBD_SET_BLKSIZE);
+		CODE_CASE(NBD_SET_SIZE);
+		CODE_CASE(NBD_DO_IT);
+		CODE_CASE(NBD_CLEAR_SOCK);
+		CODE_CASE(NBD_CLEAR_QUE);
+		CODE_CASE(NBD_PRINT_DEBUG);
+		CODE_CASE(NBD_SET_SIZE_BLOCKS);
+		CODE_CASE(NBD_DISCONNECT);
+		CODE_CASE(NBD_SET_TIMEOUT);
+		CODE_CASE(NBD_SET_FLAGS);
+		default:
+			return "Unknown";
+	}
+	#undef CODE_CASE
+}
+
+const char* nbd_cmd_str(int cmd)
+{
+	#define CODE_CASE(code) case code: return #code;
+	switch (cmd) {
+		CODE_CASE(NBD_CMD_READ);
+		CODE_CASE(NBD_CMD_WRITE);
+		CODE_CASE(NBD_CMD_DISC);
+		CODE_CASE(NBD_CMD_FLUSH);
+		CODE_CASE(NBD_CMD_TRIM);
 		default:
 			return "Unknown";
 	}
@@ -111,7 +143,7 @@ kern_return_t nbd_start(kmod_info_t* ki, void* d)
 	printf("nbd_start>\n");
 	// asm("int $3");
 	
-	bzero((void*)nbd_table, sizeof(nbd_table));
+	bzero(nbd_table, sizeof(nbd_table));
 
 	if ((nbd_bdev_major = bdevsw_add(-1, &nbd_bdevsw)) == -1) {
 		goto error;
@@ -164,135 +196,311 @@ kern_return_t nbd_stop(kmod_info_t* ki, void* d)
 	}
 
     for (int i = 0; i < NBD_DEVICES; i++) {
+		printf("nbd_stop> devfs_remove(%d)\n", i);
     	devfs_remove(nbd_table[i].bdev);
     	nbd_table[i].bdev = NULL;
     	nbd_table[i].dev  = 0;
     	nbd_table[i].pid  = -1;
     }
 
+	printf("nbd_stop> bdevsw_remove(%d)\n", nbd_bdev_major);
 	bdevsw_remove(nbd_bdev_major, &nbd_bdevsw);
 	nbd_bdev_major = -1;
 
 	return KERN_SUCCESS;
 }
 
+static
+errno_t sock_xmit(struct nbd_device* nbd, int send, void* buf, int size)
+{
+	if (!nbd->sock) {
+		printf("sock_xmit[%d]> socket closed\n", nbd->unit);
+		return EINVAL;
+	}
+
+	do {
+		struct iovec iov;
+		struct msghdr msg;
+		size_t msglen;
+
+		iov.iov_base = buf;
+		iov.iov_len = size;
+		bzero(&msg, sizeof(msg));
+		msg.msg_iov = &iov;
+		msg.msg_iovlen = 1;
+
+		errno_t err;
+
+		if (send) {
+			err = sock_send(nbd->sock, &msg, 0, &msglen);
+		}
+		else {
+			err = sock_receive(nbd->sock, &msg, MSG_WAITALL, &msglen);
+		}
+
+		if (err) {
+			return err;
+		}
+
+		size -= msglen;
+		buf += msglen;
+	} while (size > 0);
+
+	return 0;
+}
+
+static
+void nbd_end_request(buf_t bp, uint32_t remain, errno_t err)
+{
+	printf("nbd_end_request> remain: %u, error: %u\n", remain, err);
+	buf_setresid(bp, remain);
+	buf_seterror(bp, err);
+	buf_biodone(bp);
+}
+
+static
+errno_t nbd_read_reply(struct nbd_device* nbd)
+{
+	printf("nbd_read_reply>\n");
+
+	struct nbd_reply reply;
+
+	bzero(&reply, sizeof(reply));
+	errno_t err = sock_xmit(nbd, 0, &reply, sizeof(reply));
+	if (err) {
+		printf("nbd_read_reply> sock_xmit() failed: %d\n", err);
+		return err;
+	}
+
+	uint32_t magic = ntohl(reply.magic);
+	if (magic != NBD_REPLY_MAGIC) {
+		printf("nbd_read_reply> wrong magic (0x%8.8x)\n", magic);
+		return EINVAL;
+	}
+
+	// TODO: validate this handle, make sure it's legit
+	buf_t bp = *(buf_t*)reply.handle;
+
+	err = ntohl(reply.error);
+	if (err) {
+		printf("nbd_read_reply> error from server: %d\n", err);
+		if (bp) {
+			nbd_end_request(bp, buf_count(bp), err);
+		}
+		return err;
+	}
+
+	printf("nbd_read_reply> got reply: %p\n", bp);
+
+	if (bp) {
+		if (buf_flags(bp) & B_READ) {
+			printf("nbd_read_reply> B_READ\n");
+			uintptr_t data = buf_dataptr(bp);
+			uint32_t count = buf_count(bp);
+			err = sock_xmit(nbd, 0, (void*)data, count);
+			if (err) {
+				printf("nbd_read_reply> sock_xmit(data) failed: %d\n", err);
+				nbd_end_request(bp, buf_count(bp), err);
+				return err;
+			}
+		}
+		nbd_end_request(bp, 0, 0);
+	}
+
+	return 0;
+}
+
+static
+errno_t nbd_send_request(struct nbd_device* nbd, buf_t bp, int cmd)
+{
+	printf("nbd_send_request[%d]> cmd: %d, bp: %p\n", nbd->unit, cmd, bp);
+
+	struct nbd_request request;
+	bzero(&request, sizeof(request));
+	request.magic = htonl(NBD_REQUEST_MAGIC);
+	request.type = htonl(cmd);
+
+	if (bp) {
+		uint32_t count = buf_count(bp);
+		uint64_t start = (uint64_t)buf_blkno(bp) * nbd->block_size;
+		memcpy(request.handle, &bp, sizeof(bp));
+		request.from = OSSwapHostToBigInt64(start);
+		request.len = htonl(count);
+	}
+
+	errno_t err = sock_xmit(nbd, 1, &request, sizeof(request));
+	if (err) {
+		printf("nbd_send_request> sock_xmit(request) failed: %d\n", err);
+		return err;
+	}
+
+	if (cmd == NBD_CMD_WRITE) {
+		uint32_t count = buf_count(bp);
+		uintptr_t data = buf_dataptr(bp);
+		err = sock_xmit(nbd, 1, (void*)data, count);
+		if (err) {
+			printf("nbd_send_request> sock_xmit(data) failed: %d\n", err);
+			return err;
+		}
+	}
+
+	return 0;
+}
+
+static
+errno_t nbd_do_it(struct nbd_device* nbd)
+{
+	errno_t err;
+	printf("nbd_do_it>\n");
+	while ((err = nbd_read_reply(nbd)) == 0) {
+	}
+	printf("nbd_do_it> done: %d\n", err);
+	nbd->sock = NULL;
+	return err;
+}
 
 int nbd_open(dev_t dev, int flags, int devtype, struct proc* p)
 {
-	struct nbd_device* nbd_dev = nbd_get_dev(dev);
-	if (!nbd_dev) {
+	struct nbd_device* nbd = nbd_get_dev(dev);
+	if (!nbd) {
+		printf("nbd_open[%d]> ENXIO\n", minor(dev));
 		return (ENXIO);
 	}
 
-	printf("nbd_open> unit: %d\n", nbd_dev->unit);
+	printf("nbd_open[%d]>\n", nbd->unit);
 
 	return(0);
 }
 
 int nbd_close(dev_t dev, int flags, int devtype, struct proc* p)
 {
-	struct nbd_device* nbd_dev = nbd_get_dev(dev);
-	if (!nbd_dev) {
+	struct nbd_device* nbd = nbd_get_dev(dev);
+	if (!nbd) {
+		printf("nbd_close[%d]> ENXIO\n", minor(dev));
 		return (ENXIO);
 	}
 
-	printf("nbd_close> unit: %d\n", nbd_dev->unit);
+	printf("nbd_close[%d]>\n", nbd->unit);
 	return(0);
 }
 
-void nbd_async_read(struct nbd_device* nbd_dev, struct buf* bp)
-{
-	uint32_t count = buf_count(bp);
-	uint64_t start = (uint64_t)buf_blkno(bp) * nbd_dev->block_size;
-	printf("nbd_async_read> unit: %d, start: %llu, count: %u\n", nbd_dev->unit, start, count);
-}
-
-void nbd_async_write(struct nbd_device* nbd_dev, struct buf* bp)
-{
-	uint32_t count = buf_count(bp);
-	uint64_t start = (uint64_t)buf_blkno(bp) * nbd_dev->block_size;
-	printf("nbd_async_write> unit: %d, start: %llu, count: %u\n", nbd_dev->unit, start, count);
-}
-
-void nbd_strategy(struct buf* bp)
+void nbd_strategy(buf_t bp)
 {
 	dev_t dev = buf_device(bp);
-	struct nbd_device* nbd_dev = nbd_get_dev(dev);
-	if (!nbd_dev) {
+	struct nbd_device* nbd = nbd_get_dev(dev);
+	if (!nbd) {
+		printf("nbd_strategy[%d]> ENXIO\n", minor(dev));
 		buf_setresid(bp, buf_count(bp));
 		buf_seterror(bp, ENXIO);
 		buf_biodone(bp);
 		return;
 	}
 
-	// uintptr_t data = buf_dataptr(bp);
-	// bufattr_t attr = buf_attr(bp);
-
-	// if (start >= mediaSize) {
-	// }
-
+	// TODO: check that buf lies within media
+	errno_t err = ENXIO;
 	if (buf_flags(bp) & B_READ) {
-		nbd_async_read(nbd_dev, bp);
+		err = nbd_send_request(nbd, bp, NBD_CMD_READ);
 	}
 	else {
-		nbd_async_write(nbd_dev, bp);
+		err = nbd_send_request(nbd, bp, NBD_CMD_WRITE);
 	}
-
-	buf_setresid(bp, 0);
-	buf_seterror(bp, 0);
-	buf_biodone(bp);
+	if (err) {
+		printf("nbd_strategy[%d]> error: %d\n", nbd->unit, err);
+		buf_setresid(bp, buf_count(bp));
+		buf_seterror(bp, ENXIO);
+		buf_biodone(bp);
+	}
 }
 
 int nbd_ioctl(dev_t dev, u_long cmd, caddr_t data, int fflag, struct proc* p)
 {
-	struct nbd_device* nbd_dev = nbd_get_dev(dev);
-	if (!nbd_dev) {
+	struct nbd_device* nbd = nbd_get_dev(dev);
+	if (!nbd) {
+		printf("nbd_ioctl[%d]> ENXIO\n", minor(dev));
 		return (ENXIO);
 	}
 
-	printf("nbd_ioctl> unit: %d, cmd: %s (0x%8.8lx)\n", nbd_dev->unit, ioctl_cmd(cmd), cmd);
+	printf("nbd_ioctl[%d]> cmd: %s (0x%8.8lx)\n", nbd->unit, ioctl_cmd(cmd), cmd);
 
-	int error = 0;
+	int err = 0;
 	uint32_t* arg32 = (uint32_t *)data;
 	uint64_t* arg64 = (uint64_t *)data;
 
 	switch (cmd) {
 		case DKIOCGETBLOCKSIZE:
-			*arg32 = nbd_dev->block_size;
-			break;
+			*arg32 = nbd->block_size;
+			return 0;
 		case DKIOCSETBLOCKSIZE:
 			if (*arg32 > 0) {
 				printf("nbd_ioctl> DKIOCSETBLOCKSIZE: %u\n", *arg32);
-				nbd_dev->block_size = *arg32;
+				nbd->block_size = *arg32;
+				return 0;
 			}
-			else {
-				error = EINVAL;
-			}
-			break;
+			return EINVAL;
 		case DKIOCGETBLOCKCOUNT:
-			if (nbd_dev->block_size) {
-				*arg64 = nbd_dev->disk_size / nbd_dev->block_size;
+			if (nbd->block_size) {
+				*arg64 = nbd->disk_size / nbd->block_size;
 			}
 			else {
 				*arg64 = 0;
 			}
+			return 0;
+		case NBD_SET_SOCK: {
+			printf("nbd_ioctl> NBD_SET_SOCK> fd: %u, pid: %u\n", *arg32, proc_pid(p));
+			if (nbd->sock) {
+				return (EBUSY);
+			}
+			socket_t sock;
+			err = file_socket(*arg32, &sock);
+			if (!err) {
+				nbd->sock = sock;
+			}
+			return err;
+		}
+		case NBD_SET_BLKSIZE:
+			printf("nbd_ioctl> NBD_SET_BLKSIZE: %u\n", *arg32);
+			nbd->block_size = *arg32;
+			nbd->disk_size &= ~(nbd->block_size - 1);
+			return 0;
+		case NBD_SET_SIZE:
+			printf("nbd_ioctl> NBD_SET_SIZE: %llu\n", *arg64);
+			nbd->disk_size = (*arg64) & ~(nbd->block_size - 1);
+			return 0;
+		case NBD_DO_IT:
+			return nbd_do_it(nbd);
+		case NBD_CLEAR_SOCK:
+			nbd->sock = NULL;
+			return 0;
+		case NBD_CLEAR_QUE:
 			break;
+		case NBD_PRINT_DEBUG:
+			break;
+		case NBD_SET_SIZE_BLOCKS:
+			nbd->disk_size = (*arg64) * nbd->block_size;
+			return 0;
+		case NBD_DISCONNECT:
+			return nbd_send_request(nbd, NULL, NBD_CMD_DISC);
+		case NBD_SET_TIMEOUT:
+			break;
+		case NBD_SET_FLAGS:
+			nbd->flags = *arg32;
+			return 0;
 		default:
-			error = ENOTTY;
-			break;
+			return ENOTTY;
 	}
 
-	return (error);
+	return (err);
 }
 
 int nbd_psize(dev_t dev)
 {
-	struct nbd_device* nbd_dev = nbd_get_dev(dev);
-	if (!nbd_dev) {
+	struct nbd_device* nbd = nbd_get_dev(dev);
+	if (!nbd) {
+		printf("nbd_psize[%d]> ENXIO\n", minor(dev));
 		return (ENXIO);
 	}
 
-	printf("nbd_psize> unit: %d\n", nbd_dev->unit);
+	printf("nbd_psize[%d]>\n", nbd->unit);
 
-	return nbd_dev->block_size;
+	return nbd->block_size;
 }

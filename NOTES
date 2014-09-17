@@ -19,3 +19,8 @@ Put this into ~/.lldbinit:
 settings set target.load-script-from-symbol-file true
 target modules add /Users/flaub/src/safedisk/xnu/nbd/build/Debug/nbd.kext/Contents/MacOS/nbd
 
+
+Packaging (eventually):
+
+https://stackoverflow.com/questions/11487596/making-os-x-installer-packages-like-a-pro-xcode4-developer-id-mountain-lion-re
+

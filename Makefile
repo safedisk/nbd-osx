@@ -1,8 +1,8 @@
-all: 
+all: buse
 	xcodebuild
 	kextlibs build/Release/nbd.kext
 
-debug:
+debug: buse
 	xcodebuild -configuration Debug
 	kextlibs build/Debug/nbd.kext
 
@@ -11,15 +11,16 @@ clean:
 	xcodebuild -configuration Debug clean
 
 load:
-	sudo kextload /tmp/nbd.kext
+	kextload /tmp/nbd.kext
 
 unload:
-	sudo kextunload /tmp/nbd.kext
+	kextunload /tmp/nbd.kext
 
 reload:
-	sudo kextunload /tmp/nbd.kext || true
-	sudo cp -R build/${CFG}/nbd.kext /tmp
+	kextunload /tmp/nbd.kext || true
+	cp -R build/Debug/nbd.kext /tmp
 	kextutil -tn /tmp/nbd.kext
-	sudo kextload /tmp/nbd.kext
+	kextload /tmp/nbd.kext
 
-# https://stackoverflow.com/questions/11487596/making-os-x-installer-packages-like-a-pro-xcode4-developer-id-mountain-lion-re
+buse: client/main.cpp
+	g++ -std=c++11 -Inbd -O0 -o buse client/main.cpp

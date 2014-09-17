@@ -23,3 +23,6 @@ xcuserdata
 *.moved-aside
 DerivedData
 *.xcuserstate
+
+### Custom ###
+/buse

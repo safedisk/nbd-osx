@@ -30,6 +30,8 @@
 		<string>13.3</string>
 		<key>com.apple.kpi.libkern</key>
 		<string>13.3</string>
+		<key>com.apple.kpi.mach</key>
+		<string>13.3</string>
 	</dict>
 </dict>
 </plist>
